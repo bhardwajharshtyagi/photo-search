@@ -117,6 +117,33 @@ def _fetch_ddg(query, count):
     return out
 
 
+def _fetch_openverse(query, count):
+    """Openverse (WordPress) image search — proper search engine, API key
+    nahi chahiye, aur datacenter IP (Render) par block nahi hota.
+    Multi-word query ('golden temple') ko server-side phrase ki tarah
+    samajhta hai, isliye 'sirf pehla word' wali problem nahi aati."""
+    try:
+        data = _http_get("https://api.openverse.org/v1/images/",
+                         {"q": query, "page_size": str(min(count, 20)),
+                          "filter_dead": "true"},
+                         {"User-Agent": UA,
+                          "Accept-Language": "en-US,en;q=0.9"})
+        j = json.loads(data)
+        out = []
+        for it in j.get("results", [])[:count]:
+            full = it.get("url", "") or ""
+            thumb = it.get("thumbnail", "") or full
+            title = it.get("title", "") or query
+            page = it.get("foreign_landing_url", "") or ""
+            if full:
+                out.append({"title": title or query, "image": full,
+                            "thumbnail": thumb or full, "page": page,
+                            "source": "Openverse", "width": 0, "height": 0})
+        return out
+    except Exception:
+        return []
+
+
 def _fetch_wiki(query, count):
     """Fallback jo Render jaise datacenter IP par bhi chalta hai:
     Wikimedia Commons API — exact phrase search, bilkul relevant.
@@ -165,16 +192,20 @@ def _fetch_wiki(query, count):
 
 
 def fetch_images(query, count=5):
-    """Google Images style: Bing direct first (multi-image approach),
-    then DDG fallback, then Wikimedia (datacenter-friendly exact-phrase).
-    Then (1) text relevance re-ranking and
-    (2) perceptual-hash near-duplicate removal. Returns top `count`."""
+    """Google Images style: Openverse + Bing direct + DDG + Wikimedia.
+    Openverse ko sabse pehle rakha hai kyunki wo Render jaise
+    datacenter IP par bhi multi-word query ko phrase ki tarah
+    samajhta hai (Bing datacenter par kabhi sirf pehla word
+    samajhta hai — 'golden temple' -> 'golden').
+    Phir (1) text relevance re-ranking (full-phrase bonus ke saath)
+    aur (2) perceptual-hash near-duplicate removal. Top `count`."""
     query = query.strip()
     if not query:
         return []
     pool, seen_url = [], set()
     need = max(count * 6, 30)  # over-fetch so filters still leave enough
-    for fetcher in (_fetch_bing_direct, _fetch_ddg, _fetch_wiki):
+    for fetcher in (_fetch_openverse, _fetch_bing_direct,
+                    _fetch_ddg, _fetch_wiki):
         try:
             for im in fetcher(query, need):
                 u = im.get("image", "")
@@ -321,15 +352,26 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        # Render proxy kabhi path ko alag tareeke se bhejta hai, isliye
-        # raw path se query alag karke khud decode karo — taaki
-        # "golden temple" jaise multi-word query pure milein, sirf
-        # pehla word nahi.
-        raw = self.path
-        if "?" in raw:
-            path, _, qstr = raw.partition("?")
+        # FIX (Render first-word bug): Render ka proxy kabhi %20 ko
+        # request-line me wapas literal space bana deta hai, jaise:
+        #   GET /api/search?q=golden temple&n=5 HTTP/1.1
+        # HTTP me space se request-line toot jati hai, isliye
+        # BaseHTTPRequestHandler self.path me sirf pehla hissa rakhta
+        # hai ("/api/search?q=golden") — baki ("temple&n=5") kat jata
+        # hai. Isliye poori requestline se query recover karo.
+        rawline = (getattr(self, "requestline", "") or "")
+        m = re.match(r"^\S+\s+(.+?)\s+HTTP/\S*\s*$", rawline)
+        if m:
+            full_target = m.group(1)
         else:
-            path, qstr = raw, ""
+            full_target = self.path
+        if "?" in full_target:
+            path, _, qstr = full_target.partition("?")
+            path = path.split(" ", 1)[0]
+        elif "?" in self.path:
+            path, _, qstr = self.path.partition("?")
+        else:
+            path, qstr = self.path.split(" ", 1)[0], ""
         # parse_qsl '+' ko space banata hai aur %20 ko bhi — dono cover
         try:
             pairs = urllib.parse.parse_qsl(qstr, keep_blank_values=True)
@@ -342,14 +384,27 @@ class Handler(BaseHTTPRequestHandler):
         if not qs and qstr:
             try:
                 qs = urllib.parse.parse_qs(
-                    urllib.parse.urlparse(raw).query,
+                    urllib.parse.urlparse(self.path).query,
                     keep_blank_values=True)
             except Exception:
                 qs = {}
 
         if path == "/api/health":
             self._send(200, json.dumps({"ok": True, "service": "photo-search",
-                                        "version": "1.1.0"}).encode(),
+                                        "version": "1.2.0",
+                                        "build": "openverse-first"}).encode(),
+                       "application/json")
+            return
+
+        if path == "/api/debug":
+            # Render par check karne ke liye: server ko query kya mili?
+            # Kholo: /api/debug?q=golden%20temple  -> {"q": "golden temple"...}
+            self._send(200, json.dumps({"ok": True,
+                                        "q": (qs.get("q", [""])[0] or ""),
+                                        "n": (qs.get("n", [""])[0] or ""),
+                                        "requestline": getattr(
+                                            self, "requestline", ""),
+                                        "path": self.path}).encode("utf-8"),
                        "application/json")
             return
 
@@ -397,7 +452,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 images = fetch_images(q, n)
                 self._send(200, json.dumps({"ok": True, "query": q, "count": len(images),
-                                            "engine": "Google-style (DDG/Bing) + similarity 1+2", "images": images},
+                                            "engine": "Openverse+Bing/DDG/Wiki + similarity 1+2", "images": images},
                                            ensure_ascii=False).encode("utf-8"), "application/json")
             except Exception as e:
                 self._send(502, json.dumps({"ok": False, "error": str(e)}).encode("utf-8"), "application/json")
