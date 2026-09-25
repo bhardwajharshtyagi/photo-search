@@ -21,7 +21,6 @@ import urllib.request
 from difflib import SequenceMatcher as _Seq
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-PORT = 8000
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
 # ---------------- Image fetching (DuckDuckGo, Google/Bing sourced) ----------------
@@ -333,18 +332,6 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *a):
         pass  # quiet logs
-
-if __name__ == "__main__":
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    print(f"✅ Photo Search chal raha hai →  http://localhost:{PORT}")
-    print("   Search anything to get the top 5 relevant images instantly. Press Ctrl+C to stop")
-    try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        print("\n👋 Server band ho gaya")
-
-
-
 
 if __name__ == "__main__":
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
