@@ -7,6 +7,10 @@ Similarity: (1) text relevance re-ranking, (2) perceptual-hash near-duplicate re
 Run:  python3 app.py
 Open: http://localhost:8000
 """
+import os
+
+PORT = int(os.environ.get("PORT", 8000))
+
 import concurrent.futures as _fut
 import hashlib as _hashlib
 import io as _io
@@ -338,3 +342,14 @@ if __name__ == "__main__":
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\n👋 Server band ho gaya")
+
+
+
+
+if __name__ == "__main__":
+    srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    print(f"Photo Search running on port {PORT}")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nServer stopped")
