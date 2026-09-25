@@ -30,7 +30,15 @@ def _http_get(url, params=None, headers=None, timeout=15):
         url = url + ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers=headers or {"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read().decode("utf-8", "ignore")
+        raw = r.read()
+        # Render/proxy kabhi gzip bhej deta hai — usko handle karo
+        if r.headers.get("Content-Encoding", "") == "gzip":
+            import gzip as _gz
+            try:
+                raw = _gz.decompress(raw)
+            except Exception:
+                pass
+        return raw.decode("utf-8", "ignore")
 
 def _fetch_bing_direct(query, count):
     """Google Images-style multi-image approach: parses the Bing Images page +
@@ -109,16 +117,64 @@ def _fetch_ddg(query, count):
     return out
 
 
+def _fetch_wiki(query, count):
+    """Fallback jo Render jaise datacenter IP par bhi chalta hai:
+    Wikimedia Commons API — exact phrase search, bilkul relevant.
+    Isme 'golden temple' search par sirf golden-temple wali
+    images aati hain, sirf 'golden' wali nahi."""
+    try:
+        data = _http_get("https://commons.wikimedia.org/w/api.php",
+                         {"action": "query", "format": "json",
+                          "generator": "search",
+                          "gsrsearch": 'filetype:bitmap "%s"' % query,
+                          "gsrlimit": str(min(count, 20)),
+                          "gsrnamespace": "6",
+                          "prop": "imageinfo",
+                          "iiprop": "url|extmetadata",
+                          "iiurlwidth": "640"},
+                         {"User-Agent": UA,
+                          "Accept-Language": "en-US,en;q=0.9",
+                          "Referer": "https://commons.wikimedia.org/"})
+        j = json.loads(data)
+        pages = (j.get("query") or {}).get("pages", {})
+        out = []
+        for pid, pg in pages.items():
+            infos = pg.get("imageinfo") or []
+            if not infos:
+                continue
+            ii = infos[0]
+            full = ii.get("url", "")
+            thumb = ii.get("thumburl", "") or full
+            meta = ii.get("extmetadata") or {}
+            title = pg.get("title", query)
+            for k in ("ImageDescription", "ObjectName"):
+                v = (meta.get(k) or {}).get("value", "")
+                if v:
+                    title = re.sub(r"<[^>]+>", "", v).strip()[:120] or title
+                    break
+            if full:
+                out.append({"title": title or query, "image": full,
+                            "thumbnail": thumb or full,
+                            "page": ii.get("descriptionurl", ""),
+                            "source": "Wikimedia", "width": 0, "height": 0})
+            if len(out) >= count:
+                break
+        return out
+    except Exception:
+        return []
+
+
 def fetch_images(query, count=5):
     """Google Images style: Bing direct first (multi-image approach),
-    then DDG fallback. Then (1) text relevance re-ranking and
+    then DDG fallback, then Wikimedia (datacenter-friendly exact-phrase).
+    Then (1) text relevance re-ranking and
     (2) perceptual-hash near-duplicate removal. Returns top `count`."""
     query = query.strip()
     if not query:
         return []
     pool, seen_url = [], set()
     need = max(count * 6, 30)  # over-fetch so filters still leave enough
-    for fetcher in (_fetch_bing_direct, _fetch_ddg):
+    for fetcher in (_fetch_bing_direct, _fetch_ddg, _fetch_wiki):
         try:
             for im in fetcher(query, need):
                 u = im.get("image", "")
@@ -149,14 +205,21 @@ def _words(s):
             if w not in _STOP and len(w) > 1]
 
 def _text_score(query, item, base_rank):
-    """0..1 score: word overlap (60%) + fuzzy title match (25%) + engine rank (15%)."""
+    """0..1 score: word overlap (50%) + FULL-PHRASE bonus (30%) +
+    fuzzy title match (10%) + engine rank (10%).
+    Full-phrase bonus isliye taaki 'golden temple' wala title
+    sirf 'golden' wale ko hamesha hara de — Render/local dono par."""
     qw = _words(query)
     title = (item.get("title") or "") + " " + (item.get("page") or "")
     tw = set(_words(title))
     overlap = (len(set(qw) & tw) / max(len(set(qw)), 1)) if qw else 0.0
-    fuzzy = _Seq(None, query.lower(), (item.get("title") or "").lower()).ratio()
+    # full phrase bonus: poora query title me aaye to bada boost
+    qlow = (query or "").lower().strip()
+    tlow = ((item.get("title") or "") + " " + (item.get("page") or "")).lower()
+    phrase = 1.0 if (qlow and qlow in tlow) else 0.0
+    fuzzy = _Seq(None, qlow, (item.get("title") or "").lower()).ratio()
     rank_bonus = 1.0 / (1.0 + base_rank * 0.15)  # earlier engine hit = small bonus
-    return round(0.60 * overlap + 0.25 * fuzzy + 0.15 * rank_bonus, 4)
+    return round(0.50 * overlap + 0.30 * phrase + 0.10 * fuzzy + 0.10 * rank_bonus, 4)
 
 def _rerank_by_text(query, items):
     scored = []
@@ -258,9 +321,31 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path
-        qs = urllib.parse.parse_qs(parsed.query)
+        # Render proxy kabhi path ko alag tareeke se bhejta hai, isliye
+        # raw path se query alag karke khud decode karo — taaki
+        # "golden temple" jaise multi-word query pure milein, sirf
+        # pehla word nahi.
+        raw = self.path
+        if "?" in raw:
+            path, _, qstr = raw.partition("?")
+        else:
+            path, qstr = raw, ""
+        # parse_qsl '+' ko space banata hai aur %20 ko bhi — dono cover
+        try:
+            pairs = urllib.parse.parse_qsl(qstr, keep_blank_values=True)
+        except Exception:
+            pairs = []
+        qs = {}
+        for k, v in pairs:
+            qs.setdefault(k, []).append(v)
+        # fallback: purana tareeka
+        if not qs and qstr:
+            try:
+                qs = urllib.parse.parse_qs(
+                    urllib.parse.urlparse(raw).query,
+                    keep_blank_values=True)
+            except Exception:
+                qs = {}
 
         if path == "/api/health":
             self._send(200, json.dumps({"ok": True, "service": "photo-search",
